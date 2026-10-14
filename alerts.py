@@ -1,20 +1,26 @@
-"""Price Alert Tool - Phase 1: Repository Skeleton, CLI and Defensive CSV Ingestion."""
+"""Price Alert Tool - Phase 2: JSON Rule Parsing and Validation."""
 
 import argparse
 import csv
 import dataclasses
 import datetime
 import decimal
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 
 # Numeric limits defined in Phase 0 specification
 _MAX_PRICE_TOKEN_LEN = 50
+_MAX_NUMERIC_TOKEN_LEN = 50
 _MAX_COEFFICIENT_DIGITS = 48
 _MAX_DECIMAL_SCALE = 18
 _MAX_MAGNITUDE = decimal.Decimal("1e30")
+
+_MIN_MA_WINDOW = 1
+_MAX_MA_WINDOW = 100_000
 
 REQUIRED_CSV_HEADERS = frozenset({"date", "instrument", "close"})
 
@@ -31,6 +37,18 @@ class PriceObservation:
     close: decimal.Decimal
 
 
+@dataclasses.dataclass(frozen=True)
+class Rule:
+    """Represents a validated alert rule."""
+    id: str
+    instrument: str
+    type: str  # "level" or "ma_cross"
+    direction: str  # "above" or "below"
+    level: decimal.Decimal | None = None
+    short: int | None = None
+    long: int | None = None
+
+
 def parse_date(token: str) -> datetime.date:
     """Parse a strict YYYY-MM-DD calendar date or raise ValueError."""
     if len(token) != 10 or token[4] != "-" or token[7] != "-":
@@ -41,17 +59,50 @@ def parse_date(token: str) -> datetime.date:
     return datetime.date(int(year_str), int(month_str), int(day_str))
 
 
+def validate_decimal_bounds(val: decimal.Decimal, context: str = "Price") -> decimal.Decimal:
+    """Validate that a Decimal satisfies Phase 0 numeric limits.
+
+    Enforces:
+    - Finite (rejects NaN, sNaN, Infinity).
+    - Strictly positive (> 0).
+    - Sign is positive.
+    - Coefficient digits count <= 48.
+    - Decimal scale <= 18 decimal places (exponent e < 0 => -e <= 18).
+    - Numeric magnitude strictly less than 10^30.
+    """
+    if not val.is_finite():
+        raise ValueError(f"{context} must be finite: {val!r}")
+
+    if val <= 0:
+        raise ValueError(f"{context} must be strictly positive (> 0): {val!r}")
+
+    sign, digits, exp = val.as_tuple()
+    if sign != 0:
+        raise ValueError(f"{context} must be positive: {val!r}")
+
+    if len(digits) > _MAX_COEFFICIENT_DIGITS:
+        raise ValueError(
+            f"{context} coefficient digits count ({len(digits)}) exceeds maximum {_MAX_COEFFICIENT_DIGITS}"
+        )
+
+    if not isinstance(exp, int):
+        raise ValueError(f"Non-integer exponent in Decimal: {exp}")
+
+    if exp < 0 and -exp > _MAX_DECIMAL_SCALE:
+        raise ValueError(
+            f"{context} decimal scale ({-exp}) exceeds maximum {_MAX_DECIMAL_SCALE}"
+        )
+
+    if val >= _MAX_MAGNITUDE:
+        raise ValueError(f"{context} magnitude must be strictly less than 10^30: {val!r}")
+
+    return val
+
+
 def parse_price(token: str) -> decimal.Decimal:
     """Parse and validate closing price token against Phase 0 numeric limits.
 
-    Enforces:
-    - Raw token length <= 50 characters (enforced before Decimal construction).
-    - Parseable as Decimal without float conversion.
-    - Finite (rejects NaN, sNaN, Infinity).
-    - Strictly positive (> 0).
-    - Decimal scale <= 18 decimal places (exponent e < 0 => -e <= 18).
-    - Numeric magnitude strictly less than 10^30.
-    - Coefficient digits count <= 48.
+    Enforces raw token length <= 50 characters before Decimal construction.
     """
     if len(token) > _MAX_PRICE_TOKEN_LEN:
         raise ValueError(
@@ -65,33 +116,73 @@ def parse_price(token: str) -> decimal.Decimal:
     except decimal.InvalidOperation as e:
         raise ValueError(f"Invalid decimal literal: {token!r}") from e
 
-    if not price.is_finite():
-        raise ValueError(f"Price must be finite: {token!r}")
+    return validate_decimal_bounds(price, context="Price")
 
-    if price <= 0:
-        raise ValueError(f"Price must be strictly positive (> 0): {token!r}")
 
-    sign, digits, exp = price.as_tuple()
-    if sign != 0:
-        raise ValueError(f"Price must be positive: {token!r}")
+def parse_level(val: Any) -> decimal.Decimal:
+    """Parse and validate level threshold against Phase 0 numeric limits.
 
-    if len(digits) > _MAX_COEFFICIENT_DIGITS:
-        raise ValueError(
-            f"Price coefficient digits count ({len(digits)}) exceeds maximum {_MAX_COEFFICIENT_DIGITS}"
-        )
+    Accepts int, Decimal, or str. Explicitly rejects bool.
+    """
+    if isinstance(val, bool):
+        raise ValueError(f"Boolean values are not valid thresholds: {val!r}")
 
-    if not isinstance(exp, int):
-        raise ValueError(f"Non-integer exponent in Decimal: {exp}")
+    if isinstance(val, decimal.Decimal):
+        dec = val
+    elif isinstance(val, int):
+        dec = decimal.Decimal(val)
+    elif isinstance(val, str):
+        if len(val) > _MAX_NUMERIC_TOKEN_LEN:
+            raise ValueError(
+                f"Threshold string length ({len(val)}) exceeds maximum {_MAX_NUMERIC_TOKEN_LEN} characters"
+            )
+        token = val.strip()
+        if not token:
+            raise ValueError("Threshold string is empty")
+        try:
+            dec = decimal.Decimal(token)
+        except decimal.InvalidOperation as e:
+            raise ValueError(f"Invalid decimal literal in threshold: {val!r}") from e
+    else:
+        raise ValueError(f"Unsupported threshold type: {type(val).__name__}")
 
-    if exp < 0 and -exp > _MAX_DECIMAL_SCALE:
-        raise ValueError(
-            f"Price decimal scale ({-exp}) exceeds maximum {_MAX_DECIMAL_SCALE}"
-        )
+    return validate_decimal_bounds(dec, context="Threshold")
 
-    if price >= _MAX_MAGNITUDE:
-        raise ValueError(f"Price magnitude must be strictly less than 10^30: {token!r}")
 
-    return price
+def validate_ma_periods(short: Any, long: Any) -> tuple[int, int]:
+    """Validate moving average short and long window periods.
+
+    Requirements:
+    - Must both be ints (not bool, not Decimal/float).
+    - 1 <= short < long <= 100000.
+    """
+    if isinstance(short, bool) or not isinstance(short, int):
+        raise ValueError(f"MA short window must be an integer, got: {short!r}")
+    if isinstance(long, bool) or not isinstance(long, int):
+        raise ValueError(f"MA long window must be an integer, got: {long!r}")
+
+    if short < _MIN_MA_WINDOW:
+        raise ValueError(f"MA short window must be >= {_MIN_MA_WINDOW}, got: {short}")
+    if short >= long:
+        raise ValueError(f"MA short window ({short}) must be strictly less than long window ({long})")
+    if long > _MAX_MA_WINDOW:
+        raise ValueError(f"MA long window ({long}) exceeds maximum permitted {_MAX_MA_WINDOW}")
+
+    return short, long
+
+
+def _bounded_parse_float(token: str) -> decimal.Decimal:
+    """Reject overlong JSON float tokens, then construct Decimal directly."""
+    if len(token) > _MAX_NUMERIC_TOKEN_LEN:
+        raise ValueError(f"JSON numeric token exceeds {_MAX_NUMERIC_TOKEN_LEN} characters")
+    return decimal.Decimal(token)
+
+
+def _bounded_parse_int(token: str) -> int:
+    """Reject overlong JSON integer tokens, then construct int directly."""
+    if len(token) > _MAX_NUMERIC_TOKEN_LEN:
+        raise ValueError(f"JSON numeric token exceeds {_MAX_NUMERIC_TOKEN_LEN} characters")
+    return int(token)
 
 
 def load_prices(path: str | Path) -> dict[str, list[PriceObservation]]:
@@ -213,6 +304,130 @@ def load_prices(path: str | Path) -> dict[str, list[PriceObservation]]:
     return instruments
 
 
+def load_rules(path: str | Path) -> list[Rule]:
+    """Load, validate, and isolate alert rules from a JSON file.
+
+    Returns:
+        A list of validated Rule objects in original file order.
+    Raises:
+        FatalInputError on missing file, unreadable file, invalid JSON syntax,
+        non-array top-level structure, or overlong numeric token (>50 chars).
+    """
+    str_path = str(path)
+    if os.path.isdir(str_path):
+        raise FatalInputError(f"Expected a JSON rules file, but '{str_path}' is a directory")
+
+    try:
+        with open(str_path, mode="r", encoding="utf-8") as f:
+            rules_data = json.load(
+                f,
+                parse_float=_bounded_parse_float,
+                parse_int=_bounded_parse_int,
+            )
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        raise FatalInputError(f"Cannot access rules file '{str_path}': {e}") from e
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        raise FatalInputError(f"Failed to parse JSON rules in '{str_path}': {e}") from e
+
+    if not isinstance(rules_data, list):
+        raise FatalInputError(
+            f"Top-level JSON structure must be an array, got: {type(rules_data).__name__}"
+        )
+
+    accepted_rules: list[Rule] = []
+    seen_ids: set[str] = set()
+
+    for idx, item in enumerate(rules_data):
+        # 1. Must be a JSON object
+        if not isinstance(item, dict):
+            sys.stderr.write(f"Warning: rule at index {idx} is not a JSON object; skipping\n")
+            continue
+
+        # 2. Validate common fields
+        rule_id = item.get("id")
+        if not isinstance(rule_id, str) or not rule_id:
+            sys.stderr.write(f"Warning: rule at index {idx}: missing or empty 'id'; skipping\n")
+            continue
+
+        instrument = item.get("instrument")
+        if not isinstance(instrument, str) or not instrument.strip():
+            sys.stderr.write(f"Warning: rule '{rule_id}': missing or empty 'instrument'; skipping\n")
+            continue
+        instrument = instrument.strip()
+
+        rule_type = item.get("type")
+        if rule_type not in ("level", "ma_cross"):
+            sys.stderr.write(
+                f"Warning: rule '{rule_id}': unsupported rule type {rule_type!r}; skipping\n"
+            )
+            continue
+
+        direction = item.get("direction")
+        if not isinstance(direction, str):
+            sys.stderr.write(
+                f"Warning: rule '{rule_id}': missing or invalid 'direction'; skipping\n"
+            )
+            continue
+        direction_norm = direction.strip().lower()
+        if direction_norm not in ("above", "below"):
+            sys.stderr.write(
+                f"Warning: rule '{rule_id}': invalid direction {direction!r} (must be 'above' or 'below'); skipping\n"
+            )
+            continue
+
+        # 3. Validate type-specific properties
+        if rule_type == "level":
+            if "level" not in item:
+                sys.stderr.write(f"Warning: rule '{rule_id}': missing 'level' field; skipping\n")
+                continue
+            try:
+                level_dec = parse_level(item["level"])
+            except ValueError as e:
+                sys.stderr.write(f"Warning: rule '{rule_id}': {e}; skipping\n")
+                continue
+
+            rule = Rule(
+                id=rule_id,
+                instrument=instrument,
+                type="level",
+                direction=direction_norm,
+                level=level_dec,
+            )
+
+        elif rule_type == "ma_cross":
+            if "short" not in item or "long" not in item:
+                sys.stderr.write(
+                    f"Warning: rule '{rule_id}': missing 'short' or 'long' field; skipping\n"
+                )
+                continue
+            try:
+                short_val, long_val = validate_ma_periods(item["short"], item["long"])
+            except ValueError as e:
+                sys.stderr.write(f"Warning: rule '{rule_id}': {e}; skipping\n")
+                continue
+
+            rule = Rule(
+                id=rule_id,
+                instrument=instrument,
+                type="ma_cross",
+                direction=direction_norm,
+                short=short_val,
+                long=long_val,
+            )
+        else:
+            continue
+
+        # 4. Check for duplicate IDs among accepted rules
+        if rule_id in seen_ids:
+            sys.stderr.write(f"Warning: duplicate rule ID '{rule_id}'; skipping duplicate\n")
+            continue
+
+        seen_ids.add(rule_id)
+        accepted_rules.append(rule)
+
+    return accepted_rules
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments for the price alert tool."""
     parser = argparse.ArgumentParser(
@@ -224,10 +439,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point for Phase 1.
+    """CLI entry point for Price Alert Tool.
 
     Returns:
-        0 on successful ingestion (even if no usable observations remain).
+        0 on successful execution (even if no usable observations or rules remain).
         1 on fatal input or configuration errors.
         2 on CLI argument parsing errors.
     """
@@ -236,23 +451,16 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 2
 
-    # Verify accessibility of both input files
-    # Check rules_file accessibility (full JSON parsing deferred to Phase 2)
-    rules_path = str(args.rules_file)
-    if os.path.isdir(rules_path):
-        sys.stderr.write(f"Error: Expected a JSON rules file, but '{rules_path}' is a directory\n")
-        return 1
-
-    try:
-        with open(rules_path, "r", encoding="utf-8") as f:
-            pass
-    except (FileNotFoundError, PermissionError, OSError) as e:
-        sys.stderr.write(f"Error: Cannot access rules file '{rules_path}': {e}\n")
-        return 1
-
     # Ingest and validate prices from CSV
     try:
         load_prices(args.prices_file)
+    except FatalInputError as e:
+        sys.stderr.write(f"Error: {e}\n")
+        return 1
+
+    # Ingest and validate rules from JSON
+    try:
+        load_rules(args.rules_file)
     except FatalInputError as e:
         sys.stderr.write(f"Error: {e}\n")
         return 1

@@ -20,10 +20,14 @@ import unittest
 from alerts import (
     FatalInputError,
     PriceObservation,
+    Rule,
     load_prices,
+    load_rules,
     main,
     parse_date,
+    parse_level,
     parse_price,
+    validate_ma_periods,
 )
 
 
@@ -552,6 +556,624 @@ class TestGroupDFatalErrorsAndCLIBehavior(BaseFileTestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, "")
         self.assertEqual(proc.stderr, "")
+
+
+class TestPhase2GroupASuccessfulRuleParsing(BaseFileTestCase):
+    """Group A: Successful parsing."""
+
+    def test_valid_level_rule_integer_threshold(self):
+        json_content = '[{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}]'
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(
+            rules[0],
+            Rule(id="r1", instrument="INFY", type="level", direction="below", level=Decimal("1500")),
+        )
+
+    def test_valid_level_rule_fractional_threshold(self):
+        json_content = '[{"id": "r1", "instrument": "INFY", "type": "level", "direction": "above", "level": 1500.50}]'
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].level, Decimal("1500.50"))
+
+    def test_valid_level_rule_numeric_string_threshold(self):
+        json_content = '[{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": "1500.75"}]'
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].level, Decimal("1500.75"))
+
+    def test_valid_ma_cross_rule(self):
+        json_content = '[{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}]'
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(
+            rules[0],
+            Rule(id="r2", instrument="TCS", type="ma_cross", direction="above", short=5, long=20),
+        )
+
+    def test_direction_case_normalization(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "BELOW", "level": 1500},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "AbOvE", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(rules[0].direction, "below")
+        self.assertEqual(rules[1].direction, "above")
+
+    def test_mixed_configuration_of_both_rule_types(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 2)
+        self.assertEqual([r.id for r in rules], ["r1", "r2"])
+
+    def test_empty_rules_array_returns_empty_list(self):
+        rules_path = self.make_file("rules.json", "[]")
+        rules = load_rules(rules_path)
+        self.assertEqual(rules, [])
+
+
+class TestPhase2GroupBCommonValidationAndIsolation(BaseFileTestCase):
+    """Group B: Common validation and fault isolation."""
+
+    def test_missing_common_fields(self):
+        json_content = (
+            '['
+            '{"instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'  # missing id
+            '{"id": "r2", "type": "level", "direction": "below", "level": 1500},'  # missing instrument
+            '{"id": "r3", "instrument": "INFY", "direction": "below", "level": 1500},'  # missing type
+            '{"id": "r4", "instrument": "INFY", "type": "level", "level": 1500},'  # missing direction
+            '{"id": "r5", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'  # valid
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r5")
+
+    def test_empty_or_invalid_id(self):
+        json_content = (
+            '['
+            '{"id": "", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": 123, "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r1")
+
+    def test_empty_or_whitespace_instrument(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r2", "instrument": "   ", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r3", "instrument": "  INFY  ", "type": "level", "direction": "below", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].instrument, "INFY")
+
+    def test_unsupported_rule_type(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "ema_cross", "direction": "below", "level": 1500},'
+            '{"id": "r2", "instrument": "INFY", "type": "rsi", "direction": "below", "level": 1500},'
+            '{"id": "r3", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r3")
+
+    def test_missing_or_invalid_direction(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "sideways", "level": 1500},'
+            '{"id": "r2", "instrument": "INFY", "type": "level", "direction": 123, "level": 1500},'
+            '{"id": "r3", "instrument": "INFY", "type": "level", "direction": "above", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r3")
+
+    def test_invalid_entry_types_inside_array(self):
+        json_content = (
+            '['
+            '"just a string",'
+            '12345,'
+            'true,'
+            'null,'
+            '[],'
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "above", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r1")
+
+    def test_invalid_rule_surrounded_by_valid_rules_is_isolated(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "above", "level": 1500},'
+            '{"id": "broken", "instrument": "INFY", "type": "ma_cross", "direction": "above", "short": 20, "long": 5},'
+            '{"id": "r3", "instrument": "TCS", "type": "level", "direction": "below", "level": 3400}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual([r.id for r in rules], ["r1", "r3"])
+
+    def test_extra_properties_are_ignored(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500, "extra": "info", "priority": 1}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r1")
+
+
+class TestPhase2GroupCThresholdValidation(BaseFileTestCase):
+    """Group C: Threshold validation."""
+
+    def test_zero_and_negative_thresholds_are_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 0},'
+            '{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": -100},'
+            '{"id": "r3", "instrument": "INFY", "type": "level", "direction": "below", "level": "-50.5"},'
+            '{"id": "r4", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r4")
+
+    def test_invalid_numeric_strings_are_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": "abc"},'
+            '{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": "1500.00.00"},'
+            '{"id": "r3", "instrument": "INFY", "type": "level", "direction": "below", "level": ""},'
+            '{"id": "r4", "instrument": "INFY", "type": "level", "direction": "below", "level": "$1500"},'
+            '{"id": "r5", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r5")
+
+    def test_nonfinite_thresholds_are_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": "NaN"},'
+            '{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": "Infinity"},'
+            '{"id": "r3", "instrument": "INFY", "type": "level", "direction": "below", "level": "-Infinity"},'
+            '{"id": "r4", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r4")
+
+    def test_boolean_thresholds_are_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": true},'
+            '{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": false},'
+            '{"id": "r3", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r3")
+
+    def test_threshold_string_length_limit(self):
+        overlong_str = "1" * 51
+        valid_str = "9" * 29 + ".5"  # 31 chars <= 50
+        json_content = (
+            '['
+            f'{{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": "{overlong_str}"}},'
+            f'{{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": "{valid_str}"}}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r2")
+
+    def test_decimal_scale_at_and_beyond_18_places(self):
+        scale_19 = "0." + "1" * 19
+        scale_18 = "0." + "1" * 18
+        json_content = (
+            '['
+            f'{{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": "{scale_19}"}},'
+            f'{{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": "{scale_18}"}},'
+            '{"id": "r3", "instrument": "INFY", "type": "level", "direction": "below", "level": "1e-19"},'
+            '{"id": "r4", "instrument": "INFY", "type": "level", "direction": "below", "level": "1e-18"}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual([r.id for r in rules], ["r2", "r4"])
+
+    def test_magnitude_limit_at_and_beyond_10_to_30(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": "1e30"},'
+            '{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": "1.5e30"},'
+            f'{{"id": "r3", "instrument": "INFY", "type": "level", "direction": "below", "level": "{"1" * 31}"}},'
+            '{"id": "r4", "instrument": "INFY", "type": "level", "direction": "below", "level": "1e29"},'
+            f'{{"id": "r5", "instrument": "INFY", "type": "level", "direction": "below", "level": "{"9" * 30}"}}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual([r.id for r in rules], ["r4", "r5"])
+
+    def test_significant_digit_limit_at_and_beyond_48_digits(self):
+        # Direct check on parse_level
+        with self.assertRaises(ValueError) as ctx:
+            parse_level("9" * 49)
+        self.assertIn("Threshold coefficient digits count (49) exceeds maximum 48", str(ctx.exception))
+
+        too_many_digits = "9" * 49
+        max_valid = "9" * 30 + "." + "9" * 17
+        json_content = (
+            '['
+            f'{{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": "{too_many_digits}"}},'
+            f'{{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": "{max_valid}"}}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual([r.id for r in rules], ["r2"])
+
+    def test_scientific_notation_thresholds(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1.5e3}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].level, Decimal("1500"))
+
+    def test_exact_decimal_preservation_for_valid_fractionals(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500.123456789012345678}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].level, Decimal("1500.123456789012345678"))
+
+
+class TestPhase2GroupDMovingAverageValidation(BaseFileTestCase):
+    """Group D: Moving-average validation."""
+
+    def test_missing_short_or_long_period(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "long": 20},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5},'
+            '{"id": "r3", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r3")
+
+    def test_boolean_ma_window_values_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": true, "long": 20},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": false},'
+            '{"id": "r3", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r3")
+
+    def test_floating_point_ma_window_values_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5.0, "long": 20},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20.0},'
+            '{"id": "r3", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r3")
+
+    def test_zero_or_negative_ma_periods_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 0, "long": 20},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": -5, "long": 20},'
+            '{"id": "r3", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": -20},'
+            '{"id": "r4", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r4")
+
+    def test_short_equal_to_long_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 10, "long": 10},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r2")
+
+    def test_short_greater_than_long_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 30, "long": 5},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r2")
+
+    def test_maximum_permitted_long_window_accepted(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 100000}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].long, 100000)
+
+    def test_long_window_exceeding_100000_rejected(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 100001},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 5, "long": 20}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r2")
+
+    def test_valid_neighboring_rules_accepted_when_ma_fails(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 50, "long": 10},'
+            '{"id": "r3", "instrument": "WIPRO", "type": "level", "direction": "above", "level": 400}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual([r.id for r in rules], ["r1", "r3"])
+
+
+class TestPhase2GroupEJSONAndFileFailures(BaseFileTestCase):
+    """Group E: JSON parsing and file failures."""
+
+    def test_missing_rules_file_is_fatal(self):
+        nonexistent = self.temp_dir / "nonexistent.json"
+        with self.assertRaises(FatalInputError) as ctx:
+            load_rules(nonexistent)
+        self.assertIn("Cannot access rules file", str(ctx.exception))
+
+    def test_invalid_json_syntax_is_fatal(self):
+        rules_path = self.make_file("broken.json", "{ broken json content")
+        with self.assertRaises(FatalInputError) as ctx:
+            load_rules(rules_path)
+        self.assertIn("Failed to parse JSON rules", str(ctx.exception))
+
+    def test_top_level_object_is_fatal(self):
+        rules_path = self.make_file("object.json", '{"id": "r1", "level": 1500}')
+        with self.assertRaises(FatalInputError) as ctx:
+            load_rules(rules_path)
+        self.assertIn("Top-level JSON structure must be an array", str(ctx.exception))
+
+    def test_other_invalid_top_level_types_are_fatal(self):
+        for invalid_json in ['"string"', '12345', 'true', 'null']:
+            rules_path = self.make_file("invalid.json", invalid_json)
+            with self.assertRaises(FatalInputError) as ctx:
+                load_rules(rules_path)
+            self.assertIn("Top-level JSON structure must be an array", str(ctx.exception))
+
+    def test_overlong_numeric_literals_rejected_at_parse_time(self):
+        # Overlong integer literal (> 50 digits)
+        overlong_int = "1" * 51
+        int_json = f'[{{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": {overlong_int}}}]'
+        rules_path_int = self.make_file("overlong_int.json", int_json)
+        with self.assertRaises(FatalInputError) as ctx:
+            load_rules(rules_path_int)
+        self.assertIn("exceeds 50 characters", str(ctx.exception))
+
+        # Overlong float literal (> 50 chars)
+        overlong_float = "1." + "1" * 50
+        float_json = f'[{{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": {overlong_float}}}]'
+        rules_path_float = self.make_file("overlong_float.json", float_json)
+        with self.assertRaises(FatalInputError) as ctx:
+            load_rules(rules_path_float)
+        self.assertIn("exceeds 50 characters", str(ctx.exception))
+
+    def test_fatal_rules_error_produces_exit_code_1_and_empty_stdout(self):
+        csv_path = self.make_file("prices.csv", "date,instrument,close\n2026-09-01,INFY,1500\n")
+        bad_json = self.make_file("bad.json", '{"not": "an array"}')
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_path), str(bad_json)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("top-level json structure must be an array", proc.stderr.lower())
+
+
+class TestPhase2GroupFDuplicateIDs(BaseFileTestCase):
+    """Group F: Duplicate rule ID handling."""
+
+    def test_first_valid_rule_wins_on_duplicate_id(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "above", "level": 1600}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].level, Decimal("1500"))
+        self.assertEqual(rules[0].direction, "below")
+
+    def test_invalid_rule_does_not_reserve_id_for_subsequent_valid_rule(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 20, "long": 5},'  # invalid: short > long
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}'  # valid
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].id, "r1")
+        self.assertEqual(rules[0].instrument, "INFY")
+        self.assertEqual(rules[0].level, Decimal("1500"))
+
+    def test_duplicate_rejection_emits_warning_and_continues(self):
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r1", "instrument": "TCS", "type": "level", "direction": "above", "level": 3400},'  # duplicate r1
+            '{"id": "r2", "instrument": "WIPRO", "type": "level", "direction": "above", "level": 400}'
+            ']'
+        )
+        rules_path = self.make_file("rules.json", json_content)
+        rules = load_rules(rules_path)
+        self.assertEqual([r.id for r in rules], ["r1", "r2"])
+
+
+class TestPhase2GroupGCLIRegression(BaseFileTestCase):
+    """Group G: CLI Regression and Integration."""
+
+    def test_cli_valid_prices_and_rules_exits_0_with_empty_stdout(self):
+        csv_path = self.make_file("prices.csv", "date,instrument,close\n2026-09-01,INFY,1500\n")
+        json_path = self.make_file("rules.json", '[{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500}]')
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_path), str(json_path)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr, "")
+
+    def test_cli_rejected_individual_rule_exits_0(self):
+        csv_path = self.make_file("prices.csv", "date,instrument,close\n2026-09-01,INFY,1500\n")
+        json_content = (
+            '['
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r2", "instrument": "TCS", "type": "ma_cross", "direction": "above", "short": 50, "long": 10}'
+            ']'
+        )
+        json_path = self.make_file("rules.json", json_content)
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_path), str(json_path)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("warning", proc.stderr.lower())
+
+    def test_cli_fatal_json_syntax_exits_1(self):
+        csv_path = self.make_file("prices.csv", "date,instrument,close\n2026-09-01,INFY,1500\n")
+        json_path = self.make_file("broken.json", "{ invalid json")
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_path), str(json_path)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("failed to parse json rules", proc.stderr.lower())
+
+    def test_cli_fatal_top_level_object_exits_1(self):
+        csv_path = self.make_file("prices.csv", "date,instrument,close\n2026-09-01,INFY,1500\n")
+        json_path = self.make_file("obj.json", '{"key": "value"}')
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_path), str(json_path)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("top-level json structure must be an array", proc.stderr.lower())
+
+    def test_cli_missing_rules_file_exits_1(self):
+        csv_path = self.make_file("prices.csv", "date,instrument,close\n2026-09-01,INFY,1500\n")
+        nonexistent = self.temp_dir / "nonexistent.json"
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_path), str(nonexistent)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("cannot access rules file", proc.stderr.lower())
+
+    def test_cli_missing_command_line_args_exits_2(self):
+        proc = subprocess.run(
+            [sys.executable, "alerts.py"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("usage:", proc.stderr.lower())
 
 
 if __name__ == "__main__":
