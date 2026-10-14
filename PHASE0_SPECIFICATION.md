@@ -71,7 +71,7 @@ The brief is silent or underspecified in several edge scenarios. Below is the co
 | **Missing Required CSV Headers** | If any required header (`date`, `instrument`, `close`) is absent, exit with code `1` and diagnostic error on stderr. | **[Engineering decision]** | A CSV missing fundamental schema headers cannot be reliably parsed; fail-fast is the safest behavior. |
 | **Row-Width & Malformed CSV Rows** | Validate record width against header width (`len(row) == len(header)`). Skip individual malformed rows with a warning on stderr; continue processing valid rows. | **[Engineering decision]** | Resilient data ingestion: structural corruption or bad fields in one row should not crash batch analysis. |
 | **Non-finite, Zero, or Negative Prices** | Prices must be finite, strictly positive numbers ($> 0$). Zero, negative, `NaN`, `Inf`, or unparseable values invalidate that row. | **[Engineering decision]** | Financial closing prices are strictly positive finite numbers. |
-| **Price Numeric Representation & Precision** | Ingest prices directly into `decimal.Decimal` under standard context precision (28 decimal digits). Never use binary floats. Cross-multiplication avoids division entirely. | **[Engineering decision]** | Eliminates floating-point representation artifacts and division rounding errors. 28 digits easily bounds integer-scaled price products. |
+| **Price Numeric Representation & Precision** | Ingest prices and thresholds directly as `decimal.Decimal` (never binary float). Level rules use exact Decimal relational comparisons. MA rules use exact integer scaling and cross-multiplication with Python arbitrary-precision integers. | **[Engineering decision]** | Eliminates binary floating-point artifacts and decouples MA evaluation from Decimal context precision limits (`prec=28`). Integer scaling over common decimal scale guarantees exact comparisons. |
 | **JSON Threshold Parsing** | Parse numeric JSON values using `json.load(..., parse_float=decimal.Decimal)`. Direct float conversions are avoided. | **[Engineering decision]** | Prevents binary IEEE 754 precision distortion during configuration loading. |
 | **Instrument Case Sensitivity** | Instrument symbols are treated as case-sensitive exact string matches (e.g., `INFY` != `infy`). Surrounding whitespace is stripped. | **[Engineering decision]** | Exchange tickers are canonical identifiers; stripping whitespace prevents invisible formatting errors. |
 | **Unknown / Unreferenced Instruments** | Instruments in CSV not monitored by any rule are ignored without error. Instruments in JSON missing from CSV produce no alerts. | **[Engineering decision]** | Production datasets contain thousands of tickers while rules monitor a configured subset. |
@@ -122,8 +122,11 @@ For each record line in the CSV file:
    - Case-sensitive (e.g., `TCS` is distinct from `tcs`).
 6. **Close Field (`close`):**
    - Must parse directly into `decimal.Decimal` from the trimmed string token.
-   - Must be strictly positive ($close > 0$) and finite (rejecting `NaN`, `sNaN`, `+Infinity`, `-Infinity`).
-   - If conversion fails or value is non-positive/non-finite, the row is skipped with a warning on `stderr`.
+   - **Validation Rules & Resource Limits:**
+     - Must be strictly positive ($close > 0$) and finite (rejecting `NaN`, `sNaN`, `+Infinity`, `-Infinity`).
+     - Token length must not exceed 50 characters (prevents denial-of-service and memory exhaustion from unbounded numeric tokens).
+     - Decimal scale (fractional digits) must not exceed 18 decimal places ($0 \le d_i \le 18$), accommodating all real-world financial feeds (typically 2 to 6 decimals) while guaranteeing bounded scaling.
+   - If conversion fails or value violates any validation rule, the row is skipped with a warning on `stderr`.
    - Binary floating-point conversions (`float()`) are strictly prohibited during ingestion.
 
 #### 3.1.3 Deduplication and Chronological Ordering
@@ -172,7 +175,9 @@ with open(rules_path, "r", encoding="utf-8") as f:
 - `level` (numeric or string): The threshold price.
   - If a JSON number (float or int), `parse_float=decimal.Decimal` yields `Decimal` or `int` safely converted to `decimal.Decimal(level)`.
   - If a JSON string, parsed via `decimal.Decimal(level.strip())`.
-  - Must parse to a finite, strictly positive `decimal.Decimal` ($> 0$).
+  - **Validation Rules & Resource Limits:**
+    - Must be strictly positive ($level > 0$) and finite (rejecting `NaN`, `sNaN`, `+Infinity`, `-Infinity`).
+    - Raw token length must not exceed 50 characters, and decimal scale must not exceed 18 decimal places.
   - Booleans (`true`, `false`) must be explicitly rejected (`isinstance(val, bool)` is checked and rejected).
 
 ##### Moving Average Crossover Rule Schema (`type: "ma_cross"`)
@@ -186,12 +191,12 @@ with open(rules_path, "r", encoding="utf-8") as f:
   "direction": "above"
 }
 ```
-- `short` (integer): Length of the short observation window. Must be a strictly positive integer ($short \ge 1$). Booleans (`true`, `false`) must be rejected.
-- `long` (integer): Length of the long observation window. Must be a strictly positive integer with $long > short$. Booleans must be rejected.
+- `short` (integer): Length of the short observation window. Must be a strictly positive integer with $1 \le short < long \le 100,000$. Booleans (`true`, `false`) must be rejected.
+- `long` (integer): Length of the long observation window. Must be a strictly positive integer with $short < long \le 100,000$. Booleans must be rejected.
 
 #### 3.2.3 Validation and Fault Isolation
 - **Fatal Config Errors (Exit Code `1`):** Rules file does not exist, file unreadable, invalid JSON syntax, top-level JSON is not an array.
-- **Individual Rule Errors (Warning on stderr, rule skipped):** Missing required fields, unknown `type`, invalid `direction`, non-positive or inverted MA periods ($short \ge long$), boolean values passed for integer parameters, invalid numeric threshold.
+- **Individual Rule Errors (Warning on stderr, rule skipped):** Missing required fields, unknown `type`, invalid `direction`, non-positive or inverted MA periods ($short \ge long$), window sizes exceeding 100,000, boolean values passed for integer parameters, invalid numeric threshold.
 - All valid rules within the configuration must be evaluated even if some rules are rejected.
 
 ---
@@ -206,6 +211,8 @@ Let $P_t$ be the closing price of the instrument on observation day $t$ ($t \in 
 
 The strict side of the price relative to $L$ is defined as:
 $$\text{side}(P_t) = \begin{cases} \text{ABOVE} & \text{if } P_t > L \\ \text{BELOW} & \text{if } P_t < L \\ \text{EQUAL} & \text{if } P_t = L \end{cases}$$
+
+For `level` rules, comparisons ($P_t > L$, $P_t < L$, $P_t == L$) are direct relational comparisons between `decimal.Decimal` instances. In Python's `decimal` module, relational comparisons determine exact mathematical ordering without rounding or context precision loss.
 
 #### 4.1.2 State Transition and Equality Policy (Last-Known-Strict-Side)
 To prevent spurious alerts caused by price oscillation onto the threshold itself, the evaluator tracks the `last_strict_side` $\in \{\text{NONE}, \text{BELOW}, \text{ABOVE}\}$:
@@ -257,38 +264,61 @@ $$SMA_k(t) = \frac{1}{k} \sum_{i=t-k+1}^{t} P_i \quad \text{for } t \ge k-1$$
   - Observation 20 (zero-based index $t = 19$): First valid $SMA_{20}$. Establishes baseline relationship $\text{rel}(19)$. No alert possible.
   - Observation 21 (zero-based index $t = 20$): Second valid $SMA_{20}$. Earliest observation on which an alert can fire if $\text{rel}(20)$ strictly crosses $\text{rel}(19)$.
 
-#### 4.2.3 Arithmetic Precision Policy via Cross-Multiplication
-To eliminate rounding discrepancies, division artifacts, and platform-dependent floating-point precision loss, moving average comparisons are computed using integer cross-multiplication:
-$$\frac{A_S(t)}{S} \gtrless \frac{A_M(t)}{M} \iff A_S(t) \cdot M \gtrless A_M(t) \cdot S$$
-Where:
-- $A_S(t) = \sum_{i=t-S+1}^{t} P_i$ (sum of prices over the short window).
-- $A_M(t) = \sum_{i=t-M+1}^{t} P_i$ (sum of prices over the long window).
-- Since $S > 0$ and $M > 0$, multiplying by $S \cdot M$ strictly preserves the relational order ($<$, $>$, $=$).
+#### 4.2.3 Arithmetic Precision Policy: Exact Integer Scaling & Cross-Multiplication
+Relying on Python's default `decimal.Decimal` context (`decimal.getcontext().prec = 28`) is insufficient to claim unconditional exactness, because Decimal additions and multiplications will round if accumulated digits exceed context precision.
 
-**Precision Policy:**
-- All price values are ingested as `decimal.Decimal` objects.
-- Python's standard `decimal` context provides a default precision of 28 significant decimal digits (`decimal.getcontext().prec = 28`).
-- Because cross-multiplication uses strictly addition and multiplication with integer window lengths ($S, M$), no division is performed.
-- Standard financial closing prices with 2 to 6 decimal places multiplied by window sizes up to thousands require fewer than 20 significant digits, fitting comfortably within 28 digits without precision loss or rounding error.
+To guarantee mathematically exact comparisons for all accepted finite decimal prices without dependence on the `decimal` arithmetic context, moving-average evaluation employs an **exact integer-scaled representation**:
+
+##### 1. Common Decimal Scale Determination
+For each instrument's chronologically ordered, deduplicated price series $\{P_0, P_1, \dots, P_{N-1}\}$:
+Each price $P_i$ is a validated finite `decimal.Decimal`. The number of decimal places for $P_i$ is given by:
+$$d_i = \max(0, -P_i.\text{as\_tuple}().\text{exponent})$$
+The common decimal scale for the instrument series is the maximum fractional scale across all observations:
+$$scale = \max_{0 \le i < N} d_i$$
+*(Within the enforced limit $0 \le scale \le 18$. If all prices are integers, $scale = 0$.)*
+
+##### 2. Exact Integer Unit Conversion
+Each price $P_i$ is mapped to an exact integer quantity of scale units ($10^{-scale}$) without floating-point conversion and without rounding:
+$$I_i = \text{int}(P_i \times 10^{scale})$$
+Because $scale \ge d_i$ for all $i$, shifting the decimal point by $10^{scale}$ produces an exact integer $I_i \in \mathbb{Z}^+$.
+
+##### 3. Rolling Window Sums via Arbitrary-Precision Integers
+Python's built-in `int` type supports arbitrary precision (unbounded integers). Rolling window sums are accumulated strictly using Python integers:
+$$S_{short}(t) = \sum_{j=t-S+1}^{t} I_j, \quad S_{long}(t) = \sum_{j=t-M+1}^{t} I_j$$
+Since $I_j$ are exact integers, $S_{short}(t)$ and $S_{long}(t)$ are exact integer representations of the sums:
+$$\sum_{j=t-S+1}^t P_j = S_{short}(t) \times 10^{-scale}, \quad \sum_{j=t-M+1}^t P_j = S_{long}(t) \times 10^{-scale}$$
+
+##### 4. Integer Cross-Multiplication
+The short and long simple moving averages are:
+$$SMA_S(t) = \frac{S_{short}(t) \times 10^{-scale}}{S}, \quad SMA_M(t) = \frac{S_{long}(t) \times 10^{-scale}}{M}$$
+Since $S > 0$, $M > 0$, and $10^{scale} > 0$, multiplying both sides by $S \cdot M \cdot 10^{scale}$ strictly preserves the ordering without division:
+$$SMA_S(t) \gtrless SMA_M(t) \iff S_{short}(t) \times M \gtrless S_{long}(t) \times S$$
+
+Let the integer cross-product difference be:
+$$\Delta_{int}(t) = S_{short}(t) \times M - S_{long}(t) \times S$$
+$$\text{rel}(t) = \begin{cases} \text{ABOVE} & \text{if } \Delta_{int}(t) > 0 \\ \text{BELOW} & \text{if } \Delta_{int}(t) < 0 \\ \text{EQUAL} & \text{if } \Delta_{int}(t) = 0 \end{cases}$$
+
+##### Why This Guarantees Exactness
+1. **Zero Division:** The division operation $\frac{1}{k}\sum P_i$ is eliminated via cross-multiplication, avoiding recurring fractional remainders and rounding policies.
+2. **Arbitrary-Precision Integers:** Python integers automatically expand in memory to accommodate any number of digits. Therefore, $S_{short}(t) \times M$ and $S_{long}(t) \times S$ never overflow, truncate, or round.
+3. **Decoupled from Decimal Context:** The calculation is entirely independent of `decimal.getcontext().prec`, guaranteeing exact results for all valid inputs satisfying the documented scale bounds.
+4. **Separation of Concerns:** `decimal.Decimal` remains the standard representation for CSV parsing, threshold parsing, and direct level crossing comparisons ($P_t \gtrless L$), where relational operators are exact and non-rounding.
 
 #### 4.2.4 Relationship State Tracking and Equality Policy
-Let $\Delta(t) = A_S(t) \cdot M - A_M(t) \cdot S$:
-$$\text{rel}(t) = \begin{cases} \text{ABOVE} & \text{if } \Delta(t) > 0 \\ \text{BELOW} & \text{if } \Delta(t) < 0 \\ \text{EQUAL} & \text{if } \Delta(t) = 0 \end{cases}$$
-
 The evaluator maintains `last_strict_rel` $\in \{\text{NONE}, \text{BELOW}, \text{ABOVE}\}$:
 1. At the first day where long SMA is available (zero-based index $t = M - 1$, observation $M$):
-   - If $\Delta(t) > 0 \implies \text{last\_strict\_rel} = \text{ABOVE}$.
-   - If $\Delta(t) < 0 \implies \text{last\_strict\_rel} = \text{BELOW}$.
-   - If $\Delta(t) = 0 \implies \text{last\_strict\_rel} = \text{NONE}$.
+   - If $\Delta_{int}(t) > 0 \implies \text{last\_strict\_rel} = \text{ABOVE}$.
+   - If $\Delta_{int}(t) < 0 \implies \text{last\_strict\_rel} = \text{BELOW}$.
+   - If $\Delta_{int}(t) = 0 \implies \text{last\_strict\_rel} = \text{NONE}$.
    - **No alert fires at $t = M - 1$**.
 2. For each subsequent day $t \ge M$ (observation $M + 1$ onward):
-   - If $\Delta(t) > 0$:
+   - If $\Delta_{int}(t) > 0$:
      - If $\text{last\_strict\_rel} == \text{BELOW}$ and $\text{direction} == \text{"above"}$: **FIRE ALERT**.
      - $\text{last\_strict\_rel} \leftarrow \text{ABOVE}$.
-   - If $\Delta(t) < 0$:
+   - If $\Delta_{int}(t) < 0$:
      - If $\text{last\_strict\_rel} == \text{ABOVE}$ and $\text{direction} == \text{"below"}$: **FIRE ALERT**.
      - $\text{last\_strict\_rel} \leftarrow \text{BELOW}$.
-   - If $\Delta(t) = 0$:
+   - If $\Delta_{int}(t) = 0$:
      - $\text{last\_strict\_rel}$ **remains unchanged**. No alert fires.
 
 ---
@@ -363,7 +393,7 @@ The acceptance-test matrix defines 20 implementation-independent verification sc
 | **TC-09** | Normal MA Crossover Below (Death Cross) | 21 observations ($t=0 \dots 20$) for rule `5/20 below`. Obs 1..16 ($t=0 \dots 15$): `100.0`; Obs 17..20 ($t=16 \dots 19$): `120.0` ($SMA_5=116 > SMA_{20}=104$); Obs 21 ($t=20$): `10.0` ($SMA_5=98 < SMA_{20}=99.5$). | Exactly 1 alert on observation 21 (zero-based index 20): `ma_cross 5/20 below`. | REQ-07 & REQ-08: Earliest crossover at observation 21 (index 20). |
 | **TC-10** | MA Window Boundary ($M$ vs $M+1$) | Exactly 20 daily observations (obs 1..20, zero-based indices $t=0 \dots 19$) for a 5/20 rule. | 0 alerts fired. Observation 20 ($t=19$) establishes initial baseline relationship. | REQ-08: Full window required; crossover requires $M+1$ observations. |
 | **TC-11** | MA Insufficient History | Exactly 19 daily observations (obs 1..19, zero-based indices $t=0 \dots 18$) for a 5/20 rule. | 0 alerts fired. Long SMA window (20 observations) is never satisfied. | REQ-08: Moving averages require full observation window. |
-| **TC-12** | MA Cross Equality Touch | 5/20 SMAs transition from short < long to short == long, then short < long. | 0 alerts fired. No alert on equality touch. | Decision: Last-known-strict-side equality for MA. |
+| **TC-12** | Concrete MA Cross Equality Touch (`BELOW` $\to$ `EQUAL` $\to$ `BELOW`) | 22 consecutive observations ($t = 0 \dots 21$) for rule `5/20` (either `above` or `below`):<br>• Obs 1–16 ($t = 0 \dots 15$): price `100.0`<br>• Obs 17–20 ($t = 16 \dots 19$): price `80.0`<br>• Obs 21 ($t = 20$): price `180.0`<br>• Obs 22 ($t = 21$): price `10.0` | **Exactly 0 alerts fired.** `stdout` is 0 bytes.<br><br>**Mathematical Verification:**<br>1. **At Obs 20 ($t=19$):**<br>&nbsp;&nbsp;&bull; $SMA_5 = (100 + 4 \times 80)/5 = 84.0$<br>&nbsp;&nbsp;&bull; $SMA_{20} = (16 \times 100 + 4 \times 80)/20 = 96.0$<br>&nbsp;&nbsp;&bull; Cross-products: $420 \times 20 = 8400 < 1920 \times 5 = 9600 \implies \text{rel}(19) = \text{BELOW}$.<br>&nbsp;&nbsp;&bull; Initializes $\text{last\_strict\_rel} = \text{BELOW}$. No alert.<br>2. **At Obs 21 ($t=20$):**<br>&nbsp;&nbsp;&bull; $SMA_5 = (4 \times 80 + 180)/5 = 100.0$<br>&nbsp;&nbsp;&bull; $SMA_{20} = (15 \times 100 + 4 \times 80 + 180)/20 = 100.0$<br>&nbsp;&nbsp;&bull; Cross-products: $500 \times 20 = 10000 == 2000 \times 5 = 10000 \implies \text{rel}(20) = \text{EQUAL}$.<br>&nbsp;&nbsp;&bull; State policy: $\text{last\_strict\_rel}$ preserved as $\text{BELOW}$. No alert.<br>3. **At Obs 22 ($t=21$):**<br>&nbsp;&nbsp;&bull; $SMA_5 = (3 \times 80 + 180 + 10)/5 = 86.0$<br>&nbsp;&nbsp;&bull; $SMA_{20} = (14 \times 100 + 4 \times 80 + 180 + 10)/20 = 95.5$<br>&nbsp;&nbsp;&bull; Cross-products: $430 \times 20 = 8600 < 1910 \times 5 = 9550 \implies \text{rel}(21) = \text{BELOW}$.<br>&nbsp;&nbsp;&bull; State policy: remained on $\text{BELOW}$ side ($\text{BELOW} \to \text{BELOW}$). No alert. | Decision: Last-known-strict-side equality tracking for MA; equality preserves previous strict state, and returning to previous strict state is not a crossover. |
 | **TC-13** | Out-of-Order CSV Dates | CSV contains dates scrambled: `2026-09-05`, `2026-09-01`, `2026-09-03`. | Evaluated in strictly sorted order (`09-01`, `09-03`, `09-05`). | REQ-03: Chronological sorting of unordered input. |
 | **TC-14** | Duplicate Observations | Two valid entries for `(INFY, 2026-09-01)` with prices `1490` then `1520`. | Later price (`1520`) is retained; earlier (`1490`) discarded. | Decision: Deduplication retains last valid occurrence. |
 | **TC-15** | Whitespace Around Headers & Values | CSV headers ` date , instrument , close `, rows ` 2026-09-02 , INFY , 1520.00 `. | Parsed cleanly without error, triggers alert. | Decision: Stripping surrounding whitespace. |
@@ -393,11 +423,11 @@ To consider Phase 0 complete and transition into Phase 1 (Architecture & Skeleto
 - [x] All assessment requirements cataloged and cross-checked (`REQ-01` through `REQ-15`).
 - [x] All missing specifications and engineering decisions resolved with deterministic policies.
 - [x] Zero unresolved ambiguities remaining.
-- [x] Complete CSV input contract defined (row-width validation against header, whitespace, errors, deduplication, sorting).
-- [x] Complete JSON rules contract defined (schemas, parameter ranges, `parse_float=decimal.Decimal`, fault isolation).
-- [x] Exact mathematical contracts established for both `level` and `ma_cross` rules with 28-digit Decimal precision policy and exact cross-multiplication.
+- [x] Complete CSV input contract defined (row-width validation against header, bounded token length and decimal scale, whitespace, errors, deduplication, sorting).
+- [x] Complete JSON rules contract defined (schemas, parameter ranges, `parse_float=decimal.Decimal`, bounded windows and scales, fault isolation).
+- [x] Exact mathematical contracts established for both `level` and `ma_cross` rules, specifying exact Decimal relational comparisons for levels, bounded input scales, and exact integer-scaled cross-multiplication for moving averages decoupled from Decimal context precision.
 - [x] Collect-sort-emit output architecture and CLI error-handling contract frozen (exit codes `0`, `1`, `2`).
-- [x] 20-scenario acceptance-test matrix defined with mathematically verified synthetic series and explicit 1-based observation / 0-based index notation.
+- [x] 20-scenario acceptance-test matrix defined with mathematically verified synthetic series (including concrete Golden Cross, Death Cross, and Equality Touch fixtures) and explicit 1-based observation / 0-based index notation.
 - [x] Scope boundaries and non-goals explicitly recorded.
 - [x] Deliverable `PHASE0_SPECIFICATION.md` updated without modifying or adding any application or test files.
 - [x] No application or test code implemented prematurely.
