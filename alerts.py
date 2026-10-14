@@ -1,4 +1,4 @@
-"""Price Alert Tool - Phase 2: JSON Rule Parsing and Validation."""
+"""Price Alert Tool - Phase 3: Alert Evaluation Engine and Output."""
 
 import argparse
 import csv
@@ -47,6 +47,15 @@ class Rule:
     level: decimal.Decimal | None = None
     short: int | None = None
     long: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Alert:
+    """Represents a single triggered price alert."""
+    date: datetime.date
+    rule_id: str
+    instrument: str
+    summary: str
 
 
 def parse_date(token: str) -> datetime.date:
@@ -428,6 +437,189 @@ def load_rules(path: str | Path) -> list[Rule]:
     return accepted_rules
 
 
+def format_level_threshold(level: decimal.Decimal) -> str:
+    """Format a Decimal threshold without context-dependent arithmetic or trailing zeros."""
+    sign, digits, exp = level.as_tuple()
+    if exp >= 0:
+        return "".join(map(str, digits)) + ("0" * exp)
+
+    num_str = "".join(map(str, digits))
+    neg_exp = -exp
+    if neg_exp >= len(num_str):
+        formatted = "0." + ("0" * (neg_exp - len(num_str))) + num_str
+    else:
+        split_idx = len(num_str) - neg_exp
+        formatted = num_str[:split_idx] + "." + num_str[split_idx:]
+
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return formatted
+
+
+def price_to_scaled_int(price: decimal.Decimal, scale: int) -> int:
+    """Convert Decimal price to scaled integer with zero Decimal arithmetic."""
+    sign, digits, exp = price.as_tuple()
+    coeff = int("".join(map(str, digits)))
+    shift = exp + scale
+    return coeff * (10 ** shift)
+
+
+def evaluate_level(series: list[PriceObservation], rule: Rule) -> list[Alert]:
+    """Evaluate a level threshold crossing rule against an instrument's price series."""
+    if rule.level is None or not series:
+        return []
+
+    target_level = rule.level
+    alerts: list[Alert] = []
+
+    # First observation establishes baseline state
+    first_price = series[0].close
+    if first_price > target_level:
+        last_strict_side = "ABOVE"
+    elif first_price < target_level:
+        last_strict_side = "BELOW"
+    else:
+        last_strict_side = None
+
+    summary_text = f"level {rule.direction} {format_level_threshold(target_level)}"
+
+    # Subsequent observations
+    for obs in series[1:]:
+        p = obs.close
+        if p > target_level:
+            if last_strict_side == "BELOW" and rule.direction == "above":
+                alerts.append(
+                    Alert(
+                        date=obs.date,
+                        rule_id=rule.id,
+                        instrument=rule.instrument,
+                        summary=summary_text,
+                    )
+                )
+            last_strict_side = "ABOVE"
+        elif p < target_level:
+            if last_strict_side == "ABOVE" and rule.direction == "below":
+                alerts.append(
+                    Alert(
+                        date=obs.date,
+                        rule_id=rule.id,
+                        instrument=rule.instrument,
+                        summary=summary_text,
+                    )
+                )
+            last_strict_side = "BELOW"
+        else:
+            # p == target_level: equality maintains last_strict_side unchanged
+            pass
+
+    return alerts
+
+
+def evaluate_ma_cross(series: list[PriceObservation], rule: Rule) -> list[Alert]:
+    """Evaluate an ma_cross rule using exact integer-scaled sums and cross-multiplication."""
+    if rule.short is None or rule.long is None:
+        return []
+    S = rule.short
+    M = rule.long
+    if len(series) < M + 1:
+        return []
+
+    # 1. Determine common decimal scale across the series
+    scale = max(max(0, -obs.close.as_tuple()[2]) for obs in series)
+
+    # 2. Convert each price to scaled integer
+    int_prices = [price_to_scaled_int(obs.close, scale) for obs in series]
+
+    alerts: list[Alert] = []
+
+    # 3. Initialize rolling sums at index M - 1 (observation M)
+    # Short window covers [M - S, M - 1] (S observations)
+    # Long window covers [0, M - 1] (M observations)
+    s_short = sum(int_prices[M - S : M])
+    s_long = sum(int_prices[0 : M])
+
+    # Initial baseline relationship at index M - 1 (cannot fire an alert)
+    diff = s_short * M - s_long * S
+    if diff > 0:
+        last_strict_rel = "ABOVE"
+    elif diff < 0:
+        last_strict_rel = "BELOW"
+    else:
+        last_strict_rel = None
+
+    summary_text = f"ma_cross {S}/{M} {rule.direction}"
+
+    # 4. Roll window from index M (observation M + 1) to end
+    for t in range(M, len(series)):
+        s_short += int_prices[t] - int_prices[t - S]
+        s_long += int_prices[t] - int_prices[t - M]
+
+        diff = s_short * M - s_long * S
+        if diff > 0:
+            if last_strict_rel == "BELOW" and rule.direction == "above":
+                alerts.append(
+                    Alert(
+                        date=series[t].date,
+                        rule_id=rule.id,
+                        instrument=rule.instrument,
+                        summary=summary_text,
+                    )
+                )
+            last_strict_rel = "ABOVE"
+        elif diff < 0:
+            if last_strict_rel == "ABOVE" and rule.direction == "below":
+                alerts.append(
+                    Alert(
+                        date=series[t].date,
+                        rule_id=rule.id,
+                        instrument=rule.instrument,
+                        summary=summary_text,
+                    )
+                )
+            last_strict_rel = "BELOW"
+        else:
+            # diff == 0: equality maintains last_strict_rel unchanged
+            pass
+
+    return alerts
+
+
+def evaluate_rules(
+    prices: dict[str, list[PriceObservation]],
+    rules: list[Rule],
+) -> list[Alert]:
+    """Evaluate price alert rules against historical closing prices.
+
+    Returns:
+        Globally sorted list of Alert objects (date ascending, rule ID ascending).
+    """
+    all_alerts: list[Alert] = []
+
+    for rule in rules:
+        series = prices.get(rule.instrument)
+        if not series:
+            continue
+
+        if rule.type == "level":
+            rule_alerts = evaluate_level(series, rule)
+        elif rule.type == "ma_cross":
+            rule_alerts = evaluate_ma_cross(series, rule)
+        else:
+            continue
+
+        all_alerts.extend(rule_alerts)
+
+    # Global sort: primary key = date ascending, secondary key = rule_id lexicographical ascending
+    all_alerts.sort(key=lambda a: (a.date, a.rule_id))
+    return all_alerts
+
+
+def format_alert(alert: Alert) -> str:
+    """Format an Alert object into a standard output line according to specification."""
+    date_str = alert.date.isoformat()
+    return f"{date_str:<18}{alert.rule_id:<6}{alert.instrument:<9}{alert.summary}"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments for the price alert tool."""
     parser = argparse.ArgumentParser(
@@ -453,17 +645,24 @@ def main(argv: list[str] | None = None) -> int:
 
     # Ingest and validate prices from CSV
     try:
-        load_prices(args.prices_file)
+        prices = load_prices(args.prices_file)
     except FatalInputError as e:
         sys.stderr.write(f"Error: {e}\n")
         return 1
 
     # Ingest and validate rules from JSON
     try:
-        load_rules(args.rules_file)
+        rules = load_rules(args.rules_file)
     except FatalInputError as e:
         sys.stderr.write(f"Error: {e}\n")
         return 1
+
+    # Evaluate rules against ingested prices
+    alerts = evaluate_rules(prices, rules)
+
+    # Format and emit alerts line by line to stdout
+    for alert in alerts:
+        sys.stdout.write(format_alert(alert) + "\n")
 
     return 0
 

@@ -18,15 +18,20 @@ import tempfile
 import unittest
 
 from alerts import (
+    Alert,
     FatalInputError,
     PriceObservation,
     Rule,
+    evaluate_rules,
+    format_alert,
+    format_level_threshold,
     load_prices,
     load_rules,
     main,
     parse_date,
     parse_level,
     parse_price,
+    price_to_scaled_int,
     validate_ma_periods,
 )
 
@@ -1172,10 +1177,575 @@ class TestPhase2GroupGCLIRegression(BaseFileTestCase):
             text=True,
         )
         self.assertEqual(proc.returncode, 2)
+class TestPhase3GroupALevelCrossing(BaseFileTestCase):
+    """Group A: Level Crossing Evaluation."""
+
+    def test_level_crossing_above(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1510")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].date, datetime.date(2026, 9, 2))
+        self.assertEqual(alerts[0].rule_id, "r1")
+        self.assertEqual(alerts[0].instrument, "INFY")
+        self.assertEqual(alerts[0].summary, "level above 1500")
+
+    def test_level_crossing_below(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1510")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1490")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="below", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].date, datetime.date(2026, 9, 2))
+        self.assertEqual(alerts[0].summary, "level below 1500")
+
+    def test_level_crossing_opposite_direction_ignored(self):
+        # Crossed from below to above, but rule is "below"
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1510")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="below", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_level_no_crossing_when_all_one_side(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1450")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1480")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1490")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_level_baseline_first_observation_no_alert(self):
+        # TC-03: Single observation establishes baseline only
+        prices = {
+            "INFY": [PriceObservation(datetime.date(2026, 9, 1), Decimal("1510"))]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_level_sustained_movement_no_repeat_alert(self):
+        # TC-04: Sustained movement beyond level fires only once on initial crossing
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1510")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1520")),
+                PriceObservation(datetime.date(2026, 9, 4), Decimal("1530")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].date, datetime.date(2026, 9, 2))
+
+    def test_level_touch_then_cross(self):
+        # TC-05: 1490 -> 1500 (touch) -> 1510 (cross)
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1500")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1510")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].date, datetime.date(2026, 9, 3))
+
+    def test_level_touch_then_bounce(self):
+        # TC-06: 1490 -> 1500 (touch) -> 1495 (bounce)
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1500")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1495")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_level_above_equal_above_no_alert(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1510")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1500")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1520")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_level_initial_observation_equal_to_threshold(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1500")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1510")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].date, datetime.date(2026, 9, 3))
+
+    def test_level_multiple_recrossings(self):
+        # TC-07: [1490, 1510, 1480, 1520] with above 1500 and below 1500
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1510")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1480")),
+                PriceObservation(datetime.date(2026, 9, 4), Decimal("1520")),
+            ]
+        }
+        rules = [
+            Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500")),
+            Rule(id="r2", instrument="INFY", type="level", direction="below", level=Decimal("1500")),
+        ]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 3)
+        self.assertEqual(alerts[0].date, datetime.date(2026, 9, 2))
+        self.assertEqual(alerts[0].rule_id, "r1")
+        self.assertEqual(alerts[1].date, datetime.date(2026, 9, 3))
+        self.assertEqual(alerts[1].rule_id, "r2")
+        self.assertEqual(alerts[2].date, datetime.date(2026, 9, 4))
+        self.assertEqual(alerts[2].rule_id, "r1")
+
+    def test_level_unmonitored_instrument_ignored(self):
+        prices = {
+            "TCS": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("3400")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("3600")),
+            ]
+        }
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_level_independent_instruments(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1490")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1510")),
+            ],
+            "TCS": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("3400")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("3420")),
+            ],
+        }
+        rules = [
+            Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1500")),
+            Rule(id="r2", instrument="TCS", type="level", direction="above", level=Decimal("3500")),
+        ]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].rule_id, "r1")
+
+
+class TestPhase3GroupBMovingAverageCrossover(BaseFileTestCase):
+    """Group B: Moving-Average Crossover Evaluation."""
+
+    def test_ma_insufficient_history_no_alert(self):
+        # TC-11: Exactly 19 observations for 5/20 rule
+        start_date = datetime.date(2026, 9, 1)
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), Decimal("100.0"))
+            for i in range(19)
+        ]
+        prices = {"INFY": series}
+        rules = [Rule(id="r1", instrument="INFY", type="ma_cross", direction="above", short=5, long=20)]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_ma_full_window_boundary_baseline_only(self):
+        # TC-10: Exactly 20 observations for 5/20 rule
+        start_date = datetime.date(2026, 9, 1)
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), Decimal("100.0"))
+            for i in range(20)
+        ]
+        prices = {"INFY": series}
+        rules = [Rule(id="r1", instrument="INFY", type="ma_cross", direction="above", short=5, long=20)]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_ma_crossover_above_golden_cross(self):
+        # TC-08: 21 observations for 5/20 above
+        start_date = datetime.date(2026, 9, 1)
+        prices_list = [Decimal("100.0")] * 16 + [Decimal("80.0")] * 4 + [Decimal("200.0")]
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), p)
+            for i, p in enumerate(prices_list)
+        ]
+        prices = {"TCS": series}
+        rules = [Rule(id="r1", instrument="TCS", type="ma_cross", direction="above", short=5, long=20)]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].date, start_date + datetime.timedelta(days=20))
+        self.assertEqual(alerts[0].rule_id, "r1")
+        self.assertEqual(alerts[0].summary, "ma_cross 5/20 above")
+
+    def test_ma_crossover_below_death_cross(self):
+        # TC-09: 21 observations for 5/20 below
+        start_date = datetime.date(2026, 9, 1)
+        prices_list = [Decimal("100.0")] * 16 + [Decimal("120.0")] * 4 + [Decimal("10.0")]
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), p)
+            for i, p in enumerate(prices_list)
+        ]
+        prices = {"TCS": series}
+        rules = [Rule(id="r1", instrument="TCS", type="ma_cross", direction="below", short=5, long=20)]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].date, start_date + datetime.timedelta(days=20))
+        self.assertEqual(alerts[0].summary, "ma_cross 5/20 below")
+
+    def test_ma_equality_touch_and_bounce_no_alert(self):
+        # TC-12: 22 observations equality touch
+        start_date = datetime.date(2026, 9, 1)
+        prices_list = [Decimal("100.0")] * 16 + [Decimal("80.0")] * 4 + [Decimal("180.0")] + [Decimal("10.0")]
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), p)
+            for i, p in enumerate(prices_list)
+        ]
+        prices = {"TCS": series}
+        rules = [
+            Rule(id="r1", instrument="TCS", type="ma_cross", direction="above", short=5, long=20),
+            Rule(id="r2", instrument="TCS", type="ma_cross", direction="below", short=5, long=20),
+        ]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_ma_repeated_crossovers(self):
+        start_date = datetime.date(2026, 9, 1)
+        prices_list = (
+            [Decimal("100.0")] * 16
+            + [Decimal("80.0")] * 4
+            + [Decimal("200.0")]
+            + [Decimal("10.0")] * 4
+        )
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), p)
+            for i, p in enumerate(prices_list)
+        ]
+        prices = {"TCS": series}
+        rules = [
+            Rule(id="r1", instrument="TCS", type="ma_cross", direction="above", short=5, long=20),
+            Rule(id="r2", instrument="TCS", type="ma_cross", direction="below", short=5, long=20),
+        ]
+        alerts = evaluate_rules(prices, rules)
+        self.assertTrue(len(alerts) >= 2)
+        self.assertEqual(alerts[0].rule_id, "r1")
+        self.assertEqual(alerts[0].date, start_date + datetime.timedelta(days=20))
+        self.assertEqual(alerts[1].rule_id, "r2")
+        self.assertEqual(alerts[1].date, start_date + datetime.timedelta(days=21))
+
+    def test_ma_independent_instruments(self):
+        start_date = datetime.date(2026, 9, 1)
+        prices_tcs = [Decimal("100.0")] * 16 + [Decimal("80.0")] * 4 + [Decimal("200.0")]
+        series_tcs = [
+            PriceObservation(start_date + datetime.timedelta(days=i), p)
+            for i, p in enumerate(prices_tcs)
+        ]
+        prices_infy = [PriceObservation(start_date, Decimal("1500"))]
+
+        prices = {"TCS": series_tcs, "INFY": prices_infy}
+        rules = [
+            Rule(id="r1", instrument="TCS", type="ma_cross", direction="above", short=5, long=20),
+            Rule(id="r2", instrument="INFY", type="ma_cross", direction="above", short=5, long=20),
+        ]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].instrument, "TCS")
+
+    def test_ma_instrument_not_in_prices_produces_no_alert(self):
+        prices = {"INFY": [PriceObservation(datetime.date(2026, 9, 1), Decimal("1500"))]}
+        rules = [Rule(id="r1", instrument="WIPRO", type="ma_cross", direction="above", short=5, long=20)]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+
+class TestPhase3GroupCAlertOrdering(BaseFileTestCase):
+    """Group C: Alert Collection and Global Ordering."""
+
+    def test_alerts_ordered_by_date_ascending(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1400")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1600")),
+                PriceObservation(datetime.date(2026, 9, 3), Decimal("1400")),
+                PriceObservation(datetime.date(2026, 9, 4), Decimal("1600")),
+            ]
+        }
+        rules = [
+            Rule("r2", "INFY", "level", "below", level=Decimal("1500")),
+            Rule("r1", "INFY", "level", "above", level=Decimal("1500")),
+        ]
+        sorted_alerts = evaluate_rules(prices, rules)
+        dates = [a.date for a in sorted_alerts]
+        self.assertEqual(dates, [datetime.date(2026, 9, 2), datetime.date(2026, 9, 3), datetime.date(2026, 9, 4)])
+
+    def test_alerts_same_date_ordered_by_rule_id_lexicographically(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1400")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1600")),
+            ]
+        }
+        rules = [
+            Rule("r2", "INFY", "level", "above", level=Decimal("1500")),
+            Rule("r10", "INFY", "level", "above", level=Decimal("1450")),
+            Rule("r1", "INFY", "level", "above", level=Decimal("1550")),
+        ]
+        sorted_alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(sorted_alerts), 3)
+        rule_ids = [a.rule_id for a in sorted_alerts]
+        self.assertEqual(rule_ids, ["r1", "r10", "r2"])
+
+    def test_alerts_tie_breaking_across_instruments(self):
+        prices = {
+            "INFY": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("1400")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("1600")),
+            ],
+            "TCS": [
+                PriceObservation(datetime.date(2026, 9, 1), Decimal("3400")),
+                PriceObservation(datetime.date(2026, 9, 2), Decimal("3600")),
+            ],
+        }
+        rules = [
+            Rule("r2", "INFY", "level", "above", level=Decimal("1500")),
+            Rule("r1", "TCS", "level", "above", level=Decimal("3500")),
+        ]
+        sorted_alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(sorted_alerts), 2)
+        self.assertEqual([a.rule_id for a in sorted_alerts], ["r1", "r2"])
+
+
+class TestPhase3GroupDOutputFormatting(BaseFileTestCase):
+    """Group D: Output formatting specification."""
+
+    def test_format_alert_template_and_widths(self):
+        alert = Alert(datetime.date(2026, 9, 3), "r1", "INFY", "level below 1500")
+        line = format_alert(alert)
+        expected = "2026-09-03        r1    INFY     level below 1500"
+        self.assertEqual(line, expected)
+        self.assertEqual(line[0:18], "2026-09-03        ")
+        self.assertEqual(line[18:24], "r1    ")
+        self.assertEqual(line[24:33], "INFY     ")
+        self.assertEqual(line[33:], "level below 1500")
+
+    def test_level_summary_integer_threshold(self):
+        alert = Alert(datetime.date(2026, 9, 3), "r1", "INFY", f"level below {format_level_threshold(Decimal('1500.00'))}")
+        line = format_alert(alert)
+        self.assertIn("level below 1500", line)
+        self.assertNotIn("1500.0", line)
+
+    def test_level_summary_fractional_threshold_no_trailing_zeros(self):
+        alert = Alert(datetime.date(2026, 9, 3), "r1", "INFY", f"level above {format_level_threshold(Decimal('1500.5000'))}")
+        line = format_alert(alert)
+        self.assertIn("level above 1500.5", line)
+        self.assertNotIn("1500.50", line)
+
+    def test_ma_summary_format(self):
+        alert = Alert(datetime.date(2026, 9, 24), "r2", "TCS", "ma_cross 5/20 above")
+        line = format_alert(alert)
+        self.assertEqual(line, "2026-09-24        r2    TCS      ma_cross 5/20 above")
+
+    def test_format_level_threshold_exactness(self):
+        self.assertEqual(format_level_threshold(Decimal("1500")), "1500")
+        self.assertEqual(format_level_threshold(Decimal("1500.0")), "1500")
+        self.assertEqual(format_level_threshold(Decimal("1500.5")), "1500.5")
+        self.assertEqual(format_level_threshold(Decimal("0.050")), "0.05")
+        self.assertEqual(format_level_threshold(Decimal("1.5e3")), "1500")
+        self.assertEqual(format_level_threshold(Decimal("1500.123456789012345678")), "1500.123456789012345678")
+
+
+class TestPhase3GroupEEmptyOutput(BaseFileTestCase):
+    """Group E: Empty output when zero alerts fire."""
+
+    def test_empty_output_when_no_alerts(self):
+        prices = {"INFY": [PriceObservation(datetime.date(2026, 9, 1), Decimal("1500"))]}
+        rules = [Rule(id="r1", instrument="INFY", type="level", direction="above", level=Decimal("1600"))]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(alerts, [])
+
+
+class TestPhase3GroupFIntegration(BaseFileTestCase):
+    """Group F: End-to-End CLI Integration tests."""
+
+    def test_cli_smoke_sample_files(self):
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", "prices.csv", "rules.json"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "2026-09-03        r1    INFY     level below 1500\n")
+        self.assertEqual(proc.stderr, "")
+
+    def test_cli_multiple_alerts_sorted_output(self):
+        csv_content = (
+            "date,instrument,close\n"
+            "2026-09-01,INFY,1490\n"
+            "2026-09-02,INFY,1520\n"
+            "2026-09-03,INFY,1480\n"
+            "2026-09-01,TCS,3400\n"
+            "2026-09-02,TCS,3600\n"
+        )
+        rules_content = (
+            '['
+            '{"id": "r2", "instrument": "INFY", "type": "level", "direction": "below", "level": 1500},'
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "above", "level": 1500},'
+            '{"id": "r3", "instrument": "TCS", "type": "level", "direction": "above", "level": 3500}'
+            ']'
+        )
+        csv_file = self.make_file("prices.csv", csv_content)
+        rules_file = self.make_file("rules.json", rules_content)
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_file), str(rules_file)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        expected_stdout = (
+            "2026-09-02        r1    INFY     level above 1500\n"
+            "2026-09-02        r3    TCS      level above 3500\n"
+            "2026-09-03        r2    INFY     level below 1500\n"
+        )
+        self.assertEqual(proc.stdout, expected_stdout)
+        self.assertEqual(proc.stderr, "")
+
+    def test_cli_no_alerts_outputs_zero_bytes(self):
+        csv_content = "date,instrument,close\n2026-09-01,INFY,1500\n"
+        rules_content = '[{"id": "r1", "instrument": "INFY", "type": "level", "direction": "above", "level": 1600}]'
+        csv_file = self.make_file("prices.csv", csv_content)
+        rules_file = self.make_file("rules.json", rules_content)
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_file), str(rules_file)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("usage:", proc.stderr.lower())
+        self.assertEqual(proc.stderr, "")
+
+    def test_cli_fatal_csv_produces_no_stdout(self):
+        csv_file = self.make_file("bad.csv", "time,symbol,val\n")
+        rules_file = self.make_file("rules.json", "[]")
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_file), str(rules_file)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("missing required csv header", proc.stderr.lower())
+
+    def test_cli_fatal_json_produces_no_stdout(self):
+        csv_file = self.make_file("prices.csv", "date,instrument,close\n2026-09-01,INFY,1500\n")
+        rules_file = self.make_file("bad.json", "{ broken json")
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_file), str(rules_file)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("failed to parse json rules", proc.stderr.lower())
+
+    def test_cli_recoverable_warnings_emitted_to_stderr_and_alerts_to_stdout(self):
+        csv_content = (
+            "date,instrument,close\n"
+            "bad_row_with_wrong_fields\n"
+            "2026-09-01,INFY,1490\n"
+            "2026-09-02,INFY,1510\n"
+        )
+        rules_content = (
+            '['
+            '{"id": "bad_rule", "instrument": "INFY", "type": "ma_cross", "direction": "above", "short": 50, "long": 10},'
+            '{"id": "r1", "instrument": "INFY", "type": "level", "direction": "above", "level": 1500}'
+            ']'
+        )
+        csv_file = self.make_file("prices.csv", csv_content)
+        rules_file = self.make_file("rules.json", rules_content)
+        proc = subprocess.run(
+            [sys.executable, "alerts.py", str(csv_file), str(rules_file)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "2026-09-02        r1    INFY     level above 1500\n")
+        self.assertIn("warning", proc.stderr.lower())
+
+
+class TestPhase3GroupGNumericalBoundaries(BaseFileTestCase):
+    """Group G: Numerical Exactness and Boundaries."""
+
+    def test_ma_exact_integer_scaling_avoids_rounding(self):
+        start_date = datetime.date(2026, 9, 1)
+        # Observations 0..15: 100.0
+        # Observations 16..19: 90.0 -> at index 19, SMA_5 = 92 < SMA_20 = 98 (BELOW baseline)
+        # Observation 20: 140.000000000000000001
+        # At index 20, S_short * 20 - S_long * 5 = +15 > 0 (ABOVE).
+        # In float64, 140.000000000000000001 == 140.0, so float would evaluate to EQUAL and fail.
+        # Exact integer scaling detects +15 > 0 and fires the golden cross alert.
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), Decimal("100.0"))
+            for i in range(16)
+        ]
+        for i in range(16, 20):
+            series.append(PriceObservation(start_date + datetime.timedelta(days=i), Decimal("90.0")))
+        series.append(
+            PriceObservation(start_date + datetime.timedelta(days=20), Decimal("140.000000000000000001"))
+        )
+        prices = {"INFY": series}
+        rules = [Rule(id="r1", instrument="INFY", type="ma_cross", direction="above", short=5, long=20)]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].summary, "ma_cross 5/20 above")
+        self.assertEqual(alerts[0].date, start_date + datetime.timedelta(days=20))
+
+    def test_ma_mathematically_equal_with_different_decimal_scales(self):
+        start_date = datetime.date(2026, 9, 1)
+        series = [
+            PriceObservation(start_date + datetime.timedelta(days=i), Decimal(f"100.{'0' * (i % 6 + 1)}"))
+            for i in range(25)
+        ]
+        prices = {"INFY": series}
+        rules = [Rule(id="r1", instrument="INFY", type="ma_cross", direction="above", short=5, long=20)]
+        alerts = evaluate_rules(prices, rules)
+        self.assertEqual(len(alerts), 0)
+
+    def test_price_to_scaled_int_exactness(self):
+        self.assertEqual(price_to_scaled_int(Decimal("1500"), 2), 150000)
+        self.assertEqual(price_to_scaled_int(Decimal("1500.50"), 2), 150050)
+        self.assertEqual(price_to_scaled_int(Decimal("1.5e3"), 2), 150000)
+        self.assertEqual(price_to_scaled_int(Decimal("0.0001"), 4), 1)
+        self.assertEqual(price_to_scaled_int(Decimal("0.0001"), 6), 100)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 
