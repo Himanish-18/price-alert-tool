@@ -71,9 +71,9 @@ The brief is silent or underspecified in several edge scenarios. Below is the co
 | **Missing Required CSV Headers** | If any required header (`date`, `instrument`, `close`) is absent, exit with code `1` and diagnostic error on stderr. | **[Engineering decision]** | A CSV missing fundamental schema headers cannot be reliably parsed; fail-fast is the safest behavior. |
 | **Row-Width & Malformed CSV Rows** | Validate record width against header width (`len(row) == len(header)`). Skip individual malformed rows with a warning on stderr; continue processing valid rows. | **[Engineering decision]** | Resilient data ingestion: structural corruption or bad fields in one row should not crash batch analysis. |
 | **Non-finite, Zero, or Negative Prices** | Prices must be finite, strictly positive numbers ($> 0$). Zero, negative, `NaN`, `Inf`, or unparseable values invalidate that row. | **[Engineering decision]** | Financial closing prices are strictly positive finite numbers. |
-| **Numeric Resource Limits** | Enforce per-value numeric bounds: max 50 characters for individual CSV price tokens and JSON string thresholds; max 18 decimal places and positive magnitude $< 10^{30}$ (max 30 integer digits, max 48 significant digits) for all prices and thresholds; max MA window $\le 100,000$. Validated via `as_tuple()`. Does not restrict total file size or row count. | **[Engineering decision]** | Deliberate engineering constraint for predictable per-value resource use and DoS prevention without restricting legitimate market data or constraining overall dataset size. |
+| **Numeric Resource Limits** | Enforce per-value numeric bounds: max 50 characters for individual CSV price tokens, JSON numeric literal tokens (float and integer), and JSON string thresholds; max 18 decimal places and positive magnitude $< 10^{30}$ (max 30 integer digits, max 48 significant digits) for all prices and thresholds; max MA window $\le 100,000$. JSON numeric token lengths are enforced at parse time via bounded `parse_float` and `parse_int` callbacks before any value construction. Validated post-construction via `as_tuple()`. Does not restrict total file size or row count. | **[Engineering decision]** | Deliberate engineering constraint for predictable per-value resource use and DoS prevention without restricting legitimate market data or constraining overall dataset size. |
 | **Price Numeric Representation & Precision** | Ingest prices and thresholds as `decimal.Decimal` (never binary float). Level rules use exact Decimal relational comparisons. MA rules use exact integer scaling via `Decimal.as_tuple()` and integer cross-multiplication. | **[Engineering decision]** | Eliminates floating-point artifacts and decouples MA evaluation from Decimal context precision limits (`prec=28`). Integer scaling over common decimal scale guarantees exact comparisons. |
-| **JSON Threshold Parsing** | Parse numeric JSON values using `json.load(..., parse_float=decimal.Decimal)`. Direct float conversions are avoided. Enforce normalized numeric bounds. | **[Engineering decision]** | Prevents binary IEEE 754 precision distortion during configuration loading while validating normalized values. |
+| **JSON Threshold Parsing** | Parse JSON files using `json.load` with bounded `parse_float` and `parse_int` callbacks that reject raw numeric tokens exceeding 50 characters before constructing `decimal.Decimal` or `int` values respectively. Direct float conversions are avoided. An overlong numeric token is a fatal configuration error (exit code `1`). Enforce normalized numeric bounds post-construction. | **[Engineering decision]** | Prevents binary IEEE 754 precision distortion during configuration loading, enforces per-token resource bounds at the earliest possible interception point, and validates normalized values post-construction. |
 | **Instrument Case Sensitivity** | Instrument symbols are treated as case-sensitive exact string matches (e.g., `INFY` != `infy`). Surrounding whitespace is stripped. | **[Engineering decision]** | Exchange tickers are canonical identifiers; stripping whitespace prevents invisible formatting errors. |
 | **Unknown / Unreferenced Instruments** | Instruments in CSV not monitored by any rule are ignored without error. Instruments in JSON missing from CSV produce no alerts. | **[Engineering decision]** | Production datasets contain thousands of tickers while rules monitor a configured subset. |
 | **Invalid JSON File Structure** | If the JSON file is unreadable, syntactically invalid, or top-level structure is not a list, exit with code `1` and error on stderr. | **[Engineering decision]** | Configuration file corruption is a fatal startup failure. |
@@ -154,11 +154,37 @@ For each record line in the CSV file:
 - Any other top-level type (e.g., object `{}` or primitive string/number) is a fatal configuration error resulting in exit code `1` and an error on `stderr`.
 
 #### 3.2.2 Rule Schemas and Parsing Policy
-The JSON file must be loaded using the standard library `json.load` with `parse_float=decimal.Decimal`:
+The JSON file must be loaded using the standard library `json.load` with bounded `parse_float` and `parse_int` callbacks that enforce the 50-character per-token resource limit on raw numeric literals before constructing any Python value:
 ```python
+import decimal, json
+
+_MAX_NUMERIC_TOKEN_LEN = 50
+
+def _bounded_parse_float(token: str) -> decimal.Decimal:
+    """Reject overlong JSON float tokens, then construct Decimal directly."""
+    if len(token) > _MAX_NUMERIC_TOKEN_LEN:
+        raise ValueError(f"JSON numeric token exceeds {_MAX_NUMERIC_TOKEN_LEN} characters")
+    return decimal.Decimal(token)
+
+def _bounded_parse_int(token: str) -> int:
+    """Reject overlong JSON integer tokens, then construct int directly."""
+    if len(token) > _MAX_NUMERIC_TOKEN_LEN:
+        raise ValueError(f"JSON numeric token exceeds {_MAX_NUMERIC_TOKEN_LEN} characters")
+    return int(token)
+
 with open(rules_path, "r", encoding="utf-8") as f:
-    rules_data = json.load(f, parse_float=decimal.Decimal)
+    rules_data = json.load(
+        f,
+        parse_float=_bounded_parse_float,
+        parse_int=_bounded_parse_int,
+    )
 ```
+
+**Rationale and behavior:**
+- `parse_float` receives the raw JSON number token string for any token containing a decimal point or exponent notation (e.g., `1500.0`, `1.5e3`). The callback rejects tokens longer than 50 characters, then constructs `decimal.Decimal` directly from the token string — no intermediate `float()` conversion occurs.
+- `parse_int` receives the raw JSON number token string for integer literals (e.g., `1500`, `5`, `20`). The callback rejects tokens longer than 50 characters, then constructs a Python `int` directly. This preserves ordinary Python integers for MA window parameters (`short`, `long`) so that existing `isinstance(val, int)` validation continues to work.
+- If either callback raises `ValueError` due to an overlong token, the `json.load` call propagates the exception. This is caught at the top-level JSON loading boundary and treated as a **fatal configuration error**: the application prints a diagnostic message to `stderr` and exits with code `1`.
+- No JSON numeric value passes through Python's `float()` constructor at any point.
 
 ##### Common Fields (All Rules)
 - `id` (string): Unique identifier for the rule (e.g., `"r1"`). Must be a non-empty string.
@@ -177,8 +203,10 @@ with open(rules_path, "r", encoding="utf-8") as f:
 }
 ```
 - `level` (numeric or string): The threshold price.
-  - If a JSON number (float or int), loaded via `parse_float=decimal.Decimal` (yielding `Decimal`) or loaded as `int` safely converted via `decimal.Decimal(level)`. Note: The original lexical token text of a JSON number is absorbed by the parser, so numeric validation is enforced strictly on the resulting normalized Decimal.
-  - If a JSON string, the raw string token length must not exceed 50 characters before parsing via `decimal.Decimal(level.strip())`.
+  - If a JSON float token (contains `.` or exponent), the bounded `parse_float` callback has already rejected overlong tokens ($> 50$ characters) and constructed a `decimal.Decimal` directly from the raw token.
+  - If a JSON integer token, the bounded `parse_int` callback has already rejected overlong tokens and returned a Python `int`. The implementation converts this to `decimal.Decimal(level)` for uniform threshold validation.
+  - If a JSON string, the raw string length must not exceed 50 characters before parsing via `decimal.Decimal(level.strip())`.
+  - In all three cases, the resulting `Decimal` value is then validated against the normalized numeric bounds below.
   - **Validation Rules & Per-Value Resource Limits (Engineering Decisions):**
     - Must be strictly positive ($level > 0$) and finite (rejecting `NaN`, `sNaN`, `+Infinity`, `-Infinity`).
     - Normalized numeric bounds inspected via `as_tuple()` without context-dependent arithmetic:
@@ -203,10 +231,10 @@ with open(rules_path, "r", encoding="utf-8") as f:
 - `long` (integer): Length of the long observation window. Must be a strictly positive integer with $short < long \le 100,000$. Booleans must be rejected.
 
 #### 3.2.3 Validation and Fault Isolation
-- **Fatal Config Errors (Exit Code `1`):** Rules file does not exist, file unreadable, invalid JSON syntax, top-level JSON is not an array.
+- **Fatal Config Errors (Exit Code `1`):** Rules file does not exist, file unreadable, invalid JSON syntax, top-level JSON is not an array, or a JSON numeric literal token exceeds the 50-character resource limit (raised by the bounded `parse_float` or `parse_int` callback during `json.load`).
 - **Individual Rule Errors (Warning on stderr, rule skipped):** Missing required fields, unknown `type`, invalid `direction`, non-positive or inverted MA periods ($short \ge long$), window sizes exceeding 100,000, boolean values passed for integer parameters, invalid numeric threshold, or threshold exceeding numeric resource bounds.
 - All valid rules within the configuration must be evaluated even if some rules are rejected.
-- **Note on Resource Limits:** The numeric resource bounds (50-character raw token limit for CSV values and JSON string thresholds, max 18 decimal places, magnitude $< 10^{30}$, max MA window 100,000) are deliberate engineering decisions to guarantee predictable per-value memory and execution bounds and prevent resource exhaustion. They do not restrict total file size, overall line count, or the total number of rules.
+- **Note on Resource Limits:** The numeric resource bounds (50-character raw token limit for CSV price tokens, JSON numeric literal tokens, and JSON string thresholds; max 18 decimal places; magnitude $< 10^{30}$; max MA window 100,000) are deliberate engineering decisions to guarantee predictable per-value memory and execution bounds and prevent resource exhaustion. CSV and JSON string limits are enforced during field-level validation; JSON numeric literal limits are enforced at parse time via bounded callbacks before any value is constructed. They do not restrict total file size, overall line count, or the total number of rules.
 
 ---
 
@@ -441,7 +469,7 @@ To consider Phase 0 complete and transition into Phase 1 (Architecture & Skeleto
 - [x] All missing specifications and engineering decisions resolved with deterministic policies.
 - [x] Zero unresolved ambiguities remaining.
 - [x] Complete CSV input contract defined (row-width validation against header, bounded per-token length, decimal scale, and magnitude, whitespace, errors, deduplication, sorting).
-- [x] Complete JSON rules contract defined (schemas, parameter ranges, `parse_float=decimal.Decimal`, bounded windows and normalized scales/magnitudes, fault isolation).
+- [x] Complete JSON rules contract defined (schemas, parameter ranges, bounded `parse_float` and `parse_int` callbacks enforcing 50-character token limits before value construction, bounded windows and normalized scales/magnitudes, overlong numeric token classified as fatal error, fault isolation).
 - [x] Exact mathematical contracts established for both `level` and `ma_cross` rules, specifying exact Decimal relational comparisons for levels, bounded input scales and magnitudes, and exact integer-scaled cross-multiplication via `Decimal.as_tuple()` for moving averages decoupled from Decimal context precision.
 - [x] Collect-sort-emit output architecture and CLI error-handling contract frozen (exit codes `0`, `1`, `2`).
 - [x] 20-scenario acceptance-test matrix defined with mathematically verified synthetic series (including concrete Golden Cross, Death Cross, Equality Touch, Duplicate Resolution, and Whitespace Level Crossing fixtures) and explicit 1-based observation / 0-based index notation.
