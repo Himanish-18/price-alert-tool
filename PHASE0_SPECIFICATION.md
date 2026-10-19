@@ -3,7 +3,7 @@
 ## 1. Project Objective and Scope
 
 ### 1.1 Objective
-The **Price Alert Tool** is a command-line application developed for the Wissen Technology campus assessment. Its purpose is to read historical daily closing price data from a CSV file and alert evaluation rules from a JSON configuration file, evaluate threshold crossings and moving average crossovers deterministically, and print triggered alerts to standard output in chronological order.
+The **Price Alert Tool** is a command-line application designed for financial time series analysis. Its purpose is to read historical daily closing price data from a CSV file and alert evaluation rules from a JSON configuration file, evaluate threshold crossings and moving average crossovers deterministically, and print triggered alerts to standard output in chronological order.
 
 The evaluation engine follows a **collect-sort-emit** processing model: as closing prices are processed chronologically per instrument, all triggered alerts are collected in memory, globally sorted by date ascending and rule ID lexicographically, and finally formatted and emitted to stdout.
 
@@ -38,29 +38,29 @@ The following features and concerns are **explicitly out of scope**:
 
 ## 2. Requirements Extraction
 
-### 2.1 Requirements Explicitly Stated in the Assessment
-The assessment brief is the primary source of truth. As the workspace initially contained no local brief file, the following requirements are derived from the explicit assessment problem statement:
+### 2.1 Core System Requirements
+The following requirements define the functional behavior, mathematical rules, and operational contracts of the Price Alert Tool:
 
 | ID | Stated Requirement | Verification Source |
 |---|---|---|
-| **REQ-01** | The application must accept two positional command-line arguments: a CSV prices file path and a JSON rules file path. | Assessment Brief |
-| **REQ-02** | The CSV input schema consists of three required columns: `date,instrument,close`. | Assessment Brief |
-| **REQ-03** | CSV records may arrive with dates out of order. | Assessment Brief |
-| **REQ-04** | The JSON configuration file contains any number of alert rules. | Assessment Brief |
-| **REQ-05** | Supported rule types are `level` (price threshold crossing) and `ma_cross` (moving average crossover). | Assessment Brief |
-| **REQ-06** | A `level` alert fires when the daily closing price crosses the configured threshold in the specified direction (`above` or `below`). | Assessment Brief |
-| **REQ-07** | An `ma_cross` alert fires when the short simple moving average crosses the long simple moving average in the specified direction (`above` or `below`). | Assessment Brief |
-| **REQ-08** | Each moving average calculation requires a full observation window before being considered valid. | Assessment Brief |
-| **REQ-09** | Alerts are printed to stdout, one alert per line. | Assessment Brief |
-| **REQ-10** | Alerts must be sorted globally by `date` ascending, breaking ties by `rule_id` ascending. | Assessment Brief |
-| **REQ-11** | Days without alerts must produce no output on stdout. If no alerts fire across the entire dataset, stdout must remain completely empty. | Assessment Brief |
-| **REQ-12** | The application must run cleanly from a fresh checkout/download using a single standard command. | Assessment Brief |
-| **REQ-13** | A comprehensive test suite executable via `python -m unittest -v test_alerts.py` is mandatory. | Assessment Brief |
-| **REQ-14** | A concise README of at most one page is mandatory, explaining execution, AI assistance utilized, a genuine AI mistake encountered, and how it was corrected. | Assessment Brief |
-| **REQ-15** | Evaluation prioritizes correctness on unfamiliar inputs, edge-case resilience, test quality, and clarity of technical interview explanation. | Assessment Brief |
+| **REQ-01** | The application must accept two positional command-line arguments: a CSV prices file path and a JSON rules file path. | System Specification |
+| **REQ-02** | The CSV input schema consists of three required columns: `date,instrument,close`. | System Specification |
+| **REQ-03** | CSV records may arrive with dates out of order. | System Specification |
+| **REQ-04** | The JSON configuration file contains any number of alert rules. | System Specification |
+| **REQ-05** | Supported rule types are `level` (price threshold crossing) and `ma_cross` (moving average crossover). | System Specification |
+| **REQ-06** | A `level` alert fires when the daily closing price crosses the configured threshold in the specified direction (`above` or `below`). | System Specification |
+| **REQ-07** | An `ma_cross` alert fires when the short simple moving average crosses the long simple moving average in the specified direction (`above` or `below`). | System Specification |
+| **REQ-08** | Each moving average calculation requires a full observation window before being considered valid. | System Specification |
+| **REQ-09** | Alerts are printed to stdout, one alert per line. | System Specification |
+| **REQ-10** | Alerts must be sorted globally by `date` ascending, breaking ties by `rule_id` ascending. | System Specification |
+| **REQ-11** | Days without alerts must produce no output on stdout. If no alerts fire across the entire dataset, stdout must remain completely empty. | System Specification |
+| **REQ-12** | The application must run cleanly from a fresh checkout/download using a single standard command. | System Specification |
+| **REQ-13** | A comprehensive test suite executable via `python -m unittest -v test_alerts.py` is mandatory. | System Specification |
+| **REQ-14** | A concise README of at most one page is mandatory, explaining execution, AI assistance utilized, a genuine AI mistake encountered, and how it was corrected. | System Specification |
+| **REQ-15** | Evaluation prioritizes correctness on unfamiliar inputs, edge-case resilience, test quality, and clarity of technical architecture. | System Specification |
 
 ### 2.2 Engineering Decisions and Ambiguity Classifications
-The brief is silent or underspecified in several edge scenarios. Below is the complete taxonomy of decisions, labeled as **[Brief requirement]** or **[Engineering decision]**. With all decisions resolved deterministically, there are no remaining unresolved ambiguities.
+Below is the complete taxonomy of architectural and engineering decisions, labeled as **[Core requirement]** or **[Engineering decision]**. With all decisions resolved deterministically, there are no remaining unresolved ambiguities.
 
 | Item / Scenario | Policy & Behavior | Classification | Rationale |
 |---|---|---|---|
@@ -79,10 +79,10 @@ The brief is silent or underspecified in several edge scenarios. Below is the co
 | **Invalid JSON File Structure** | If the JSON file is unreadable, syntactically invalid, or top-level structure is not a list, exit with code `1` and error on stderr. | **[Engineering decision]** | Configuration file corruption is a fatal startup failure. |
 | **Malformed Individual Rule** | An individual rule with missing keys, invalid types, invalid direction, or $short \ge long$ is skipped with a warning on stderr; other valid rules evaluate. | **[Engineering decision]** | Fault isolation: one faulty rule definition should not blind the engine to other valid active rules. |
 | **Duplicate Rule IDs** | Rule IDs must be unique strings. If duplicate rule IDs appear in JSON, the first valid definition is retained; duplicates are skipped with a warning on stderr. | **[Engineering decision]** | Prevents ambiguous alert provenance and non-deterministic sorting. |
-| **Rule ID Ordering / Tie-Breaking** | When multiple alerts occur on the same date, break ties by comparing `rule_id` lexicographically as strings (Unicode code point order). | **[Brief requirement]** & **[Engineering decision]** | Stated in brief as "date, then rule ID". String comparison provides a deterministic total order. |
-| **Output Column Spacing** | Format output with fixed column alignment matching brief samples: date (10 chars), 8 spaces, rule ID, 4 spaces, instrument, 5 spaces, rule summary. | **[Engineering decision]** | Standardizes layout (`{date:<18}{rule_id:<6}{instrument:<9}{summary}`) matching the exact sample lines in the brief. |
-| **Level Price Formatting in Output** | If the threshold is an integral value, format without `.0` (e.g., `1500`). If fractional, preserve significant decimal digits without trailing zeros. | **[Brief requirement]** & **[Engineering decision]** | Directly follows sample output (`1500`, not `1500.0`). |
-| **MA Window Formatting in Output** | Format as `{short}/{long}` (e.g., `5/20`). | **[Brief requirement]** | Explicitly shown in assessment sample (`ma_cross 5/20 above`). |
+| **Rule ID Ordering / Tie-Breaking** | When multiple alerts occur on the same date, break ties by comparing `rule_id` lexicographically as strings (Unicode code point order). | **[Core requirement]** & **[Engineering decision]** | Specified as "date, then rule ID". String comparison provides a deterministic total order. |
+| **Output Column Spacing** | Format output with fixed column alignment matching sample output: date (10 chars), 8 spaces, rule ID, 4 spaces, instrument, 5 spaces, rule summary. | **[Engineering decision]** | Standardizes layout (`{date:<18}{rule_id:<6}{instrument:<9}{summary}`) matching the exact sample lines. |
+| **Level Price Formatting in Output** | If the threshold is an integral value, format without `.0` (e.g., `1500`). If fractional, preserve significant decimal digits without trailing zeros. | **[Core requirement]** & **[Engineering decision]** | Directly follows sample output (`1500`, not `1500.0`). |
+| **MA Window Formatting in Output** | Format as `{short}/{long}` (e.g., `5/20`). | **[Core requirement]** | Explicitly shown in specification sample (`ma_cross 5/20 above`). |
 | **Stdout vs Stderr Separation** | Stdout is strictly reserved for sorted alert lines. Diagnostics, warnings, and error messages go strictly to stderr. | **[Engineering decision]** | Essential for CLI pipeline composability (e.g., `python alerts.py prices.csv rules.json | grep ...`). |
 | **CLI Exit Codes** | `0` for success (including 0 alerts), `1` for fatal input/config errors, `2` for argument parsing errors. | **[Engineering decision]** | Standard, deterministic POSIX/Python CLI contract. |
 
@@ -302,7 +302,7 @@ $$SMA_k(t) = \frac{1}{k} \sum_{i=t-k+1}^{t} P_i \quad \text{for } t \ge k-1$$
   - Observation 21 (zero-based index $t = 20$): Second valid $SMA_{20}$. Earliest observation on which an alert can fire if $\text{rel}(20)$ strictly crosses $\text{rel}(19)$.
 
 #### 4.2.3 Arithmetic Precision Policy: Exact Integer Scaling via `Decimal.as_tuple()` & Cross-Multiplication
-The assessment requires exact crossover evaluation across arbitrary legitimate price series without precision decay or platform-dependent rounding artifacts. Relying on Decimal arithmetic operations (such as `int(P_i * 10**scale)`) is insufficient as an exactness guarantee because multiplication under Python's `decimal` module is governed by active context precision (`decimal.getcontext().prec = 28`), which will round if accumulated digits exceed the context limit.
+The system requires exact crossover evaluation across arbitrary legitimate price series without precision decay or platform-dependent rounding artifacts. Relying on Decimal arithmetic operations (such as `int(P_i * 10**scale)`) is insufficient as an exactness guarantee because multiplication under Python's `decimal` module is governed by active context precision (`decimal.getcontext().prec = 28`), which will round if accumulated digits exceed the context limit.
 
 To guarantee mathematically exact comparisons for all accepted finite decimal prices without dependence on the `decimal` arithmetic context, moving-average evaluation employs an **exact integer-scaled representation** constructed purely via `Decimal.as_tuple()` and Python arbitrary-precision integers:
 
@@ -379,7 +379,7 @@ Alert generation follows a deterministic three-stage architecture:
 3. **Emit:** Sorted alerts are formatted and emitted line-by-line to `stdout`. If no alerts were triggered across the entire run, `stdout` remains completely empty (0 bytes).
 
 ### 5.2 Formatting Specification
-#### 5.2.1 Sample Output Lines (from Brief)
+#### 5.2.1 Sample Output Lines
 ```text
 2026-09-03        r1    INFY     level below 1500
 2026-09-24        r2    TCS      ma_cross 5/20 above
@@ -465,7 +465,7 @@ To consider Phase 0 complete and transition into Phase 1 (Architecture & Skeleto
 
 - [x] Workspace inspected and verified (clean workspace confirmed).
 - [x] Git repository status verified (tracked and up-to-date with remote).
-- [x] All assessment requirements cataloged and cross-checked (`REQ-01` through `REQ-15`).
+- [x] All system requirements cataloged and cross-checked (`REQ-01` through `REQ-15`).
 - [x] All missing specifications and engineering decisions resolved with deterministic policies.
 - [x] Zero unresolved ambiguities remaining.
 - [x] Complete CSV input contract defined (row-width validation against header, bounded per-token length, decimal scale, and magnitude, whitespace, errors, deduplication, sorting).
